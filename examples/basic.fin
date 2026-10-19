@@ -1,0 +1,6 @@
+// Example usage of {{PKG_NAME}}
+
+fun main() <noret> {
+    printf("{{PKG_NAME}} example\n");
+    // TODO: add example
+}

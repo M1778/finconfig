@@ -1,0 +1,14 @@
+// {{PKG_NAME}} — {{DESCRIPTION}}
+//
+// File name matters: it must be src/{{PKG_NAME}}.fin (NOT src/lib.fin), so the
+// module name is unique per package and two dependencies never collide on
+// `lib`. Consumers import by name:
+//   import { some_function } from {{PKG_NAME}}::fin;
+// By-name calls are the import spelling the backend supports; qualified calls
+// (fin.some_function(...)) are refused.
+
+namespace fin {
+
+// TODO: implement
+
+}

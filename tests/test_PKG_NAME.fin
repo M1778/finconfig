@@ -1,0 +1,9 @@
+// Tests for {{PKG_NAME}}.
+// Run: finc -I ../src tests/test_lib.fin -o test_{{PKG_NAME}} && ./test_{{PKG_NAME}}
+import { assert_true } from testing::std;
+
+fun main() <noret> {
+    // TODO: add tests
+    assert_true(true, "placeholder");
+    printf("All tests passed!\n");
+}
