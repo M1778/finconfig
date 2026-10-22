@@ -1,2 +1,2 @@
-// Export symbols from the main library file (rename to match src/{{PKG_NAME}}.fin)
-export * from "src/{{PKG_NAME}}";
+// Export symbols from the main library file (rename to match src/finconfig.fin)
+export * from "src/finconfig";

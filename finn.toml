@@ -1,10 +1,10 @@
 [project]
-name = "{{PKG_NAME}}"
+name = "finconfig"
 version = "0.1.0"
 envpath = ".finn"
-entrypoint = "{{PKG_NAME}}.fin"
+entrypoint = "finconfig.fin"
 
 [packages]
 
 [scripts]
-test = "finc -I src tests/test_{{PKG_NAME}}.fin -o test_{{PKG_NAME}} && ./test_{{PKG_NAME}}"
+test = "finc -I src tests/test_finconfig.fin -o test_finconfig && ./test_finconfig"

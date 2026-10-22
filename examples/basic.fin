@@ -1,6 +1,45 @@
-// Example usage of {{PKG_NAME}}
+// finconfig example: load a .env-style file, read typed values, and
+// expand a path. Run: finc -I src examples/basic.fin -o example_basic
+//   && ./example_basic
+// Try it with env: APP_PORT=9090 ./example_basic  (env beats the file).
+import { Cfg, cfg_new, cfg_free, cfg_load_text, cfg_load_file, cfg_set,
+         cfg_get, cfg_get_int, cfg_get_bool,
+         cfg_get_expanded } from finconfig::fin;
+import { free_str } from strings::std;
+import { write_string } from fs::std;
 
 fun main() <noret> {
-    printf("{{PKG_NAME}} example\n");
-    // TODO: add example
+    // A small service config, .env syntax with one INI section.
+    write_string("/tmp/finconfig-example.env",
+        "APP_NAME=demo\nAPP_PORT=8080\nDEBUG=off\n[db]\nhost=localhost\nport=5432\n");
+    let c <Cfg> = cfg_new();
+    let n <int> = cfg_load_file(&c, "/tmp/finconfig-example.env");
+    printf("loaded %d keys\n", n);
+
+    // Plain string (default if absent).
+    printf("app: %s\n", cfg_get(&c, "APP_NAME", "unnamed"));
+    // Typed getters never blame: bad or missing values answer the default.
+    let port <int> = cfg_get_int(&c, "APP_PORT", 80);
+    printf("port: %d\n", port);
+    let debug <bool> = cfg_get_bool(&c, "DEBUG", false);
+    if (debug) {
+        printf("debug: on\n");
+    } else {
+        printf("debug: off\n");
+    }
+    // INI sections read back as dotted keys.
+    printf("db: %s:%d\n", cfg_get(&c, "db.host", "?"),
+           cfg_get_int(&c, "db.port", 0));
+
+    // Overrides beat everything (file and env).
+    cfg_set(&c, "APP_PORT", "9090");
+    printf("port after override: %d\n", cfg_get_int(&c, "APP_PORT", 80));
+
+    // ${...} expansion, one pass, no recursion.
+    cfg_set(&c, "ROOT", "/srv/demo");
+    let expanded <string> = cfg_get_expanded(&c, "ROOT", "");
+    printf("root: %s\n", expanded);
+    free_str(expanded);
+
+    cfg_free(&c);
 }

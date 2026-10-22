@@ -1,0 +1,580 @@
+// finconfig — layered configuration for Fin.
+//
+// One `Cfg` holds three layers, consulted in this precedence order:
+//
+//   1. Explicit overrides set with cfg_set (highest — tests, CLI flags,
+//      programmatic values that must win).
+//   2. Environment variables, looked up under the key's env spelling:
+//      uppercased with `.` and `-` rewritten to `_` (so config key
+//      `db.host` reads env `DB_HOST`). This is the 12-factor layer:
+//      deploy-time values never need a file edit.
+//   3. Values loaded from .env / INI files, in load order (last wins).
+//   4. The caller-supplied default (lowest).
+//
+// File syntax (one unified parser for .env and INI):
+//   - Blank lines and lines starting with `#` or `;` are ignored.
+//   - `KEY=VALUE` pairs; `export KEY=VALUE` is accepted (dotenv style).
+//   - `[section]` headers switch sections; keys after one are stored as
+//     `section.key` (so `[db]` + `host=...` is read back as `db.host`).
+//   - Values may be single-quoted (literal, no escapes), double-quoted
+//     (with \\, \n, \t, \r, \" escapes), or bare. Bare values have
+//     whitespace trimmed and a trailing ` # comment` stripped.
+//   - Duplicate keys: last wins. Malformed lines are skipped and counted
+//     in `Cfg.skipped` — loading never aborts on a bad line.
+//   - `cfg_load_file` returns the number of keys loaded, or -1 when the
+//     file cannot be read. `cfg_load_text` parses an in-memory document
+//     (same syntax; handy for tests and embedded defaults).
+//
+// Ownership rules (see NOTES.md: a library must never retain a
+// caller-owned pointer past the call):
+//   - Keys and values passed to cfg_set are CLONED; the caller keeps
+//     owning the originals.
+//   - cfg_get / cfg_get_file return BORROWED pointers into the Cfg (or
+//     process-owned env strings, or the caller's default) — never free
+//     them. cfg_get_list's Collection is the one exception: it is fresh
+//     heap; free each part with free_str, then `delete` the container.
+//   - cfg_expand / cfg_get_expanded return fresh heap; free with free_str.
+//   - cfg_free frees every stored key/value and all four collections.
+//     After it, no borrowed pointer from this Cfg may be used.
+//   - Typed getters never blame: a missing key or an unparseable value
+//     answers the caller-supplied default (strings::std.parse_int blames
+//     on bad input, so cfg_get_int validates first and only parses clean
+//     digit strings that fit in int range — it computes the value itself
+//     rather than calling parse_int at all).
+//
+// Fin v0.4.0 backend notes (see NOTES.md; testers should file against
+// M1778/Fin):
+//   - No `const` in library modules (not even private) — no codes needed
+//     here; precedence is fixed function order, not constants.
+//   - No mutable module-level state exists in Fin 0.4.0, so configuration
+//     lives in an explicit `Cfg` struct the caller owns and passes by `&`
+//     — the same shape as xtest's TestStats and logg's Logger.
+//   - Env access is vendored, not imported from env::std: only #[global]
+//     externs lower through a module import, so this module declares its
+//     own libc getenv spelling, exactly like logg/zhttp do.
+
+import { Collection } from collection::std;
+import { len, equals, clone, trim, substr, to_chars,
+         to_upper, to_lower, replace_char, split, find,
+         index_of_char, free_str } from strings::std;
+import { read_to_string } from fs::std;
+import { Buffer, new_buffer, free_buffer } from buffer::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Local C bindings (module-private). Vendored rather than imported: only
+// #[global] externs lower through a module import.
+// ---------------------------------------------------------------------------
+
+#[llvm_name="getenv"]
+@define fincfg_getenv(name: string) <string>;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+#[export]
+pub struct Cfg {
+    pub:
+        // File-loaded keys/values, parallel collections, insertion order.
+        // Keys are flat (`db.host` for INI `[db]` + `host`).
+        keys <&Collection<string>>,
+        vals <&Collection<string>>,
+        // Explicit overrides, same parallel shape. Checked first.
+        okeys <&Collection<string>>,
+        ovals <&Collection<string>>,
+        // Malformed lines skipped across all loads. Never aborts a load.
+        skipped <int>,
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+// Fresh, empty configuration. Nothing loaded, nothing set.
+#[export]
+pub fun cfg_new() <Cfg> {
+    return Cfg{
+        keys: new Collection::<string>{},
+        vals: new Collection::<string>{},
+        okeys: new Collection::<string>{},
+        ovals: new Collection::<string>{},
+        skipped: 0
+    };
+}
+
+// Free every stored key/value and all four collections. After this call
+// no borrowed pointer from this Cfg may be used.
+#[export]
+pub fun cfg_free(c: &Cfg) <noret> {
+    for (let i <int> = 0; i < c.keys.len(); i++) {
+        free_str(c.keys.get(i));
+        free_str(c.vals.get(i));
+    }
+    delete c.keys;
+    delete c.vals;
+    for (let j <int> = 0; j < c.okeys.len(); j++) {
+        free_str(c.okeys.get(j));
+        free_str(c.ovals.get(j));
+    }
+    delete c.okeys;
+    delete c.ovals;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers (plain functions; struct methods are not used)
+// ---------------------------------------------------------------------------
+
+// Index of key in a parallel key collection, or -1.
+fun fc_index_of(keys: &Collection<string>, key: string) <int> {
+    for (let i <int> = 0; i < keys.len(); i++) {
+        if (equals(keys.get(i), key)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Store key/value into a parallel pair, cloning both and replacing the
+// old value when the key already exists (last wins).
+fun fc_store(keys: &Collection<string>, vals: &Collection<string>,
+             key: string, val: string) <noret> {
+    let at <int> = fc_index_of(keys, key);
+    if (at >= 0) {
+        free_str(vals.get(at));
+        vals.set(at, clone(val));
+    } else {
+        keys.push(clone(key));
+        vals.push(clone(val));
+    }
+}
+
+// Env spelling of a config key: uppercased, `.` and `-` become `_`.
+fun fc_env_name(key: string) <string> {
+    let up <string> = to_upper(key);
+    let dash <string> = replace_char(up, '.', '_');
+    let out <string> = replace_char(dash, '-', '_');
+    free_str(up);
+    free_str(dash);
+    return out;
+}
+
+// Unquote one raw value (already trimmed). Single quotes are literal;
+// double quotes process \\, \n, \t, \r, \" (unknown escapes keep the
+// escaped char); bare values strip a trailing ` # comment`.
+fun fc_unquote(raw: string) <string> {
+    let n <int> = len(raw);
+    if (n >= 2) {
+        let chars <[char]> = to_chars(raw);
+        let first <char> = chars[0];
+        let last <char> = chars[n - 1];
+        // Single-quoted: literal inner text. (Single quote is char 39;
+        // spelled as a code to avoid a `'\''` literal.)
+        if (cast<int>(first) == 39 && cast<int>(last) == 39) {
+            let inner <string> = substr(raw, 1, n - 2);
+            delete chars;
+            return inner;
+        }
+        if (first == '"' && last == '"') {
+            let buf <Buffer> = new_buffer(n);
+            let i <int> = 1;
+            while (i < n - 1) {
+                let ch <char> = chars[i];
+                if (ch == '\\' && i + 1 < n - 1) {
+                    let nx <char> = chars[i + 1];
+                    if (nx == 'n') {
+                        buf.write_char(cast<char>(10));
+                    } else if (nx == 't') {
+                        buf.write_char(cast<char>(9));
+                    } else if (nx == 'r') {
+                        buf.write_char(cast<char>(13));
+                    } else if (nx == '"') {
+                        buf.write_char('"');
+                    } else if (nx == '\\') {
+                        buf.write_char('\\');
+                    } else {
+                        buf.write_char(nx);
+                    }
+                    i = i + 2;
+                } else {
+                    buf.write_char(ch);
+                    i = i + 1;
+                }
+            }
+            delete chars;
+            let out <string> = buf.to_string();
+            free_buffer(buf);
+            return out;
+        }
+        delete chars;
+    }
+    // Bare value: strip a trailing ` # comment`, then re-trim.
+    let hash <int> = find(raw, " #");
+    if (hash >= 0) {
+        let cut <string> = substr(raw, 0, hash);
+        let t <string> = trim(cut);
+        free_str(cut);
+        return t;
+    }
+    return clone(raw);
+}
+
+// Join section + "." + key. Kept as a helper so the dotted-key rule has
+// exactly one spelling (and one place to change it).
+fun fc_dotted(section: string, key: string) <string> {
+    let buf <Buffer> = new_buffer(len(section) + len(key) + 2);
+    buf.write_string(section);
+    buf.write_string(".");
+    buf.write_string(key);
+    let out <string> = buf.to_string();
+    free_buffer(buf);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+// Parse one document into the file layer. Returns keys loaded; malformed
+// lines are skipped and counted in c.skipped. Later loads override
+// earlier ones (last wins), same as duplicate keys in one document.
+#[export]
+pub fun cfg_load_text(c: &Cfg, text: string) <int> {
+    let lines <&Collection<string>> = split(text, '\n');
+    // Heap empty string (never a literal: section is free_str'd on every
+    // header switch and at the end, and free() on a literal is UB).
+    let section <string> = clone("");
+    let loaded <int> = 0;
+    for (let li <int> = 0; li < lines.len(); li++) {
+        let rawline <string> = lines.get(li);
+        let line <string> = trim(rawline);
+        free_str(rawline);
+        let ln <int> = len(line);
+        if (ln == 0) {
+            free_str(line);
+            continue;
+        }
+        let chars <[char]> = to_chars(line);
+        let c0 <char> = chars[0];
+        // Comment lines.
+        if (c0 == '#' || c0 == ';') {
+            delete chars;
+            free_str(line);
+            continue;
+        }
+        // Section header: [name].
+        if (c0 == '[' && chars[ln - 1] == ']') {
+            let next_section <string> = substr(line, 1, ln - 2);
+            let trimmed_section <string> = trim(next_section);
+            free_str(next_section);
+            free_str(section);
+            section = trimmed_section;
+            delete chars;
+            free_str(line);
+            continue;
+        }
+        delete chars;
+        // Optional `export ` prefix (dotenv style).
+        let body <string> = line;
+        if (len(line) >= 7 && equals(substr(line, 0, 7), "export ")) {
+            let rest <string> = substr(line, 7, len(line) - 7);
+            let t <string> = trim(rest);
+            free_str(rest);
+            free_str(line);
+            body = t;
+        }
+        let eq <int> = index_of_char(body, '=');
+        if (eq < 0) {
+            c.skipped = c.skipped + 1;
+            free_str(body);
+            continue;
+        }
+        let keypart <string> = substr(body, 0, eq);
+        let keytrim <string> = trim(keypart);
+        free_str(keypart);
+        let valpart <string> = substr(body, eq + 1, len(body) - eq - 1);
+        let valtrim <string> = trim(valpart);
+        free_str(valpart);
+        free_str(body);
+        if (len(keytrim) == 0) {
+            c.skipped = c.skipped + 1;
+            free_str(keytrim);
+            free_str(valtrim);
+            continue;
+        }
+        let val <string> = fc_unquote(valtrim);
+        free_str(valtrim);
+        if (len(section) > 0) {
+            // Flat key: section.key. The dotted form is what callers
+            // read back, so `db.host` and `[db] host` are one key.
+            let dotted <string> = fc_dotted(section, keytrim);
+            fc_store(c.keys, c.vals, dotted, val);
+            free_str(dotted);
+        } else {
+            fc_store(c.keys, c.vals, keytrim, val);
+        }
+        free_str(keytrim);
+        free_str(val);
+        loaded = loaded + 1;
+    }
+    delete lines;
+    free_str(section);
+    return loaded;
+}
+
+// Read a file and parse it into the file layer. Returns keys loaded, or
+// -1 when the file cannot be read (missing file, directory, permission).
+// A malformed line never fails the load; it is counted in c.skipped.
+#[export]
+pub fun cfg_load_file(c: &Cfg, path: string) <int> {
+    let content? <string> = read_to_string(path);
+    if (content == null) {
+        return -1;
+    }
+    let n <int> = cfg_load_text(c, content?);
+    free_str(content?);
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Writes (override layer)
+// ---------------------------------------------------------------------------
+
+// Set an explicit override. Highest precedence; clones key and value, so
+// the caller keeps owning the originals.
+#[export]
+pub fun cfg_set(c: &Cfg, key: string, val: string) <noret> {
+    fc_store(c.okeys, c.ovals, key, val);
+}
+
+// ---------------------------------------------------------------------------
+// Reads
+// ---------------------------------------------------------------------------
+
+// True when any layer (override, env, file) provides the key.
+#[export]
+pub fun cfg_has(c: &Cfg, key: string) <bool> {
+    if (fc_index_of(c.okeys, key) >= 0) {
+        return true;
+    }
+    let envname <string> = fc_env_name(key);
+    let v <string> = fincfg_getenv(envname);
+    free_str(envname);
+    if (v != null) {
+        return true;
+    }
+    return fc_index_of(c.keys, key) >= 0;
+}
+
+// File-layer value only (no overrides, no env). Returns "" when absent.
+// Borrowed — never free the result.
+#[export]
+pub fun cfg_get_file(c: &Cfg, key: string) <string> {
+    let at <int> = fc_index_of(c.keys, key);
+    if (at >= 0) {
+        return c.vals.get(at);
+    }
+    return "";
+}
+
+// Full precedence: override > env (mapped spelling) > file > default.
+// Borrowed — never free the result.
+#[export]
+pub fun cfg_get(c: &Cfg, key: string, default_val: string) <string> {
+    let at <int> = fc_index_of(c.okeys, key);
+    if (at >= 0) {
+        return c.ovals.get(at);
+    }
+    let envname <string> = fc_env_name(key);
+    let v <string> = fincfg_getenv(envname);
+    free_str(envname);
+    if (v != null) {
+        return v;
+    }
+    let fat <int> = fc_index_of(c.keys, key);
+    if (fat >= 0) {
+        return c.vals.get(fat);
+    }
+    return default_val;
+}
+
+// Integer getter. Never blames: missing keys, non-numeric text, and
+// out-of-range values all answer `default_val`. Accepts an optional
+// leading `+`/`-` and digits only.
+#[export]
+pub fun cfg_get_int(c: &Cfg, key: string, default_val: int) <int> {
+    if (!cfg_has(c, key)) {
+        return default_val;
+    }
+    let raw <string> = cfg_get(c, key, "");
+    let n <int> = len(raw);
+    if (n == 0) {
+        return default_val;
+    }
+    let chars <[char]> = to_chars(raw);
+    let start <int> = 0;
+    let neg <bool> = false;
+    if (chars[0] == '-' || chars[0] == '+') {
+        neg = chars[0] == '-';
+        start = 1;
+    }
+    if (start >= n) {
+        delete chars;
+        return default_val;
+    }
+    for (let i <int> = start; i < n; i++) {
+        if (chars[i] < '0' || chars[i] > '9') {
+            delete chars;
+            return default_val;
+        }
+    }
+    let digits <string> = substr(raw, start, n - start);
+    delete chars;
+    // int range guard: refuse over-long digit runs before computing, and
+    // compare equal-length 10-digit runs against the int32 limit digit
+    // by digit (equal-length digit strings order numerically).
+    if (len(digits) > 10) {
+        free_str(digits);
+        return default_val;
+    }
+    if (len(digits) == 10) {
+        let limit <string> = "2147483647";
+        if (neg) {
+            limit = "2147483648";
+        }
+        let limchars <[char]> = to_chars(limit);
+        let digchars <[char]> = to_chars(digits);
+        let over <bool> = false;
+        for (let k <int> = 0; k < 10; k++) {
+            if (digchars[k] > limchars[k]) {
+                over = true;
+                break;
+            }
+            if (digchars[k] < limchars[k]) {
+                break;
+            }
+        }
+        delete limchars;
+        delete digchars;
+        if (over) {
+            free_str(digits);
+            return default_val;
+        }
+    }
+    // Accumulate in long: the int32-min digit run "2147483648" does not
+    // fit an int while building, and wrapping int arithmetic is not
+    // something to rely on. The range guard above already proved the
+    // signed result fits int32, so the final cast is exact.
+    let acc <long> = cast<long>(0);
+    let dchars <[char]> = to_chars(digits);
+    for (let j <int> = 0; j < len(digits); j++) {
+        acc = acc * cast<long>(10) + cast<long>(cast<int>(dchars[j]) - cast<int>('0'));
+    }
+    delete dchars;
+    free_str(digits);
+    if (neg) {
+        return cast<int>(cast<long>(0) - acc);
+    }
+    return cast<int>(acc);
+}
+
+// Boolean getter. True spellings: 1, true, yes, on. False spellings:
+// 0, false, no, off (case-insensitive). Anything else answers default.
+#[export]
+pub fun cfg_get_bool(c: &Cfg, key: string, default_val: bool) <bool> {
+    if (!cfg_has(c, key)) {
+        return default_val;
+    }
+    let raw <string> = cfg_get(c, key, "");
+    let low <string> = to_lower(raw);
+    if (equals(low, "1") || equals(low, "true") || equals(low, "yes") || equals(low, "on")) {
+        free_str(low);
+        return true;
+    }
+    if (equals(low, "0") || equals(low, "false") || equals(low, "no") || equals(low, "off")) {
+        free_str(low);
+        return false;
+    }
+    free_str(low);
+    return default_val;
+}
+
+// Split a value on a separator char into a fresh Collection. Missing keys
+// answer an empty collection (never null). Caller frees each part with
+// free_str, then `delete`s the container.
+#[export]
+pub fun cfg_get_list(c: &Cfg, key: string, sep: char) <&Collection<string>> {
+    if (!cfg_has(c, key)) {
+        return new Collection::<string>{};
+    }
+    let raw <string> = cfg_get(c, key, "");
+    return split(raw, sep);
+}
+
+// ---------------------------------------------------------------------------
+// Interpolation
+// ---------------------------------------------------------------------------
+
+// Expand `${KEY}` references in `value` using full cfg_get precedence,
+// one pass, no recursion (a referenced value's own `${...}` is left
+// literal — this cannot loop). `$$` escapes to `$`; unknown or
+// unterminated references are left literal. Fresh heap — free_str it.
+#[export]
+pub fun cfg_expand(c: &Cfg, value: string) <string> {
+    let buf <Buffer> = new_buffer(len(value) + 16);
+    let chars <[char]> = to_chars(value);
+    let n <int> = len(value);
+    let i <int> = 0;
+    while (i < n) {
+        let ch <char> = chars[i];
+        if (ch == '$' && i + 1 < n && chars[i + 1] == '$') {
+            buf.write_char('$');
+            i = i + 2;
+            continue;
+        }
+        if (ch == '$' && i + 1 < n && chars[i + 1] == '{') {
+            let close <int> = -1;
+            let k <int> = i + 2;
+            while (k < n) {
+                if (chars[k] == '}') {
+                    close = k;
+                    break;
+                }
+                k = k + 1;
+            }
+            if (close < 0) {
+                buf.write_char(ch);
+                i = i + 1;
+                continue;
+            }
+            let name <string> = substr(value, i + 2, close - (i + 2));
+            if (cfg_has(c, name)) {
+                let rep <string> = cfg_get(c, name, "");
+                buf.write_string(rep);
+            } else {
+                buf.write_string("${");
+                buf.write_string(name);
+                buf.write_string("}");
+            }
+            free_str(name);
+            i = close + 1;
+            continue;
+        }
+        buf.write_char(ch);
+        i = i + 1;
+    }
+    delete chars;
+    let out <string> = buf.to_string();
+    free_buffer(buf);
+    return out;
+}
+
+// cfg_get with ${...} expansion applied. Fresh heap — free_str it.
+#[export]
+pub fun cfg_get_expanded(c: &Cfg, key: string, default_val: string) <string> {
+    let raw <string> = cfg_get(c, key, default_val);
+    return cfg_expand(c, raw);
+}
+
+}

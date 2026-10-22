@@ -1,5 +1,3 @@
+test_finconfig
+example_basic
 .finn/
-out/
-*.o
-*.exe
-test_{{PKG_NAME}}

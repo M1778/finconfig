@@ -1,0 +1,209 @@
+// Tests for finconfig.
+// Run: finc -I src tests/test_finconfig.fin -o test_finconfig && ./test_finconfig
+// Every assert_* blames (aborts, non-zero exit) on failure; a clean run
+// printing ALL TESTS PASSED means every check below passed.
+import { Cfg, cfg_new, cfg_free, cfg_load_text, cfg_load_file,
+         cfg_set, cfg_has, cfg_get, cfg_get_file, cfg_get_int,
+         cfg_get_bool, cfg_get_list, cfg_expand,
+         cfg_get_expanded } from finconfig::fin;
+import { assert_true, assert_false, assert_eq_int,
+         assert_eq_string } from testing::std;
+import { Collection } from collection::std;
+import { free_str, substr, len } from strings::std;
+import { write_string } from fs::std;
+import { set_env, unset_env } from env::std;
+
+fun check_str(c: &Cfg, key: string, expected: string, label: string) <noret> {
+    assert_eq_string(cfg_get(c, key, "<missing>"), expected, label);
+}
+
+fun test_dotenv_basics() <noret> {
+    let c <Cfg> = cfg_new();
+    let n <int> = cfg_load_text(&c,
+        "# a comment\n; another comment\n\nAPP_NAME = myapp  \nexport APP_ENV=production\nEMPTY=\nHASHED=abc#def\nCOMMENTED=value # trailing note\nSPACED   =   padded   \n");
+    assert_eq_int(n, 6, "dotenv: 6 keys loaded");
+    assert_eq_int(c.skipped, 0, "dotenv: nothing skipped");
+    check_str(&c, "APP_NAME", "myapp", "dotenv: trimmed value");
+    check_str(&c, "APP_ENV", "production", "dotenv: export prefix");
+    check_str(&c, "EMPTY", "", "dotenv: empty value");
+    check_str(&c, "HASHED", "abc#def", "dotenv: # without space kept");
+    check_str(&c, "COMMENTED", "value", "dotenv: inline comment stripped");
+    check_str(&c, "SPACED", "padded", "dotenv: spaces around = trimmed");
+    assert_true(cfg_has(&c, "APP_NAME"), "dotenv: has present key");
+    assert_false(cfg_has(&c, "NOPE"), "dotenv: has absent key");
+    assert_eq_string(cfg_get(&c, "NOPE", "dflt"), "dflt", "dotenv: default");
+    cfg_free(&c);
+}
+
+fun test_quoting() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c,
+        "SINGLE='lit $x \\n text'\nDOUBLE=\"a\\nb\\t\\\"q\\\"\\\\\"\nUNTERMINATED=\"oops\nPLAIN=bare\n");
+    check_str(&c, "SINGLE", "lit $x \\n text", "quote: single literal");
+    check_str(&c, "DOUBLE", "a\nb\t\"q\"\\", "quote: double escapes");
+    check_str(&c, "UNTERMINATED", "\"oops", "quote: unterminated stays bare");
+    check_str(&c, "PLAIN", "bare", "quote: plain untouched");
+    cfg_free(&c);
+}
+
+fun test_ini_sections() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c,
+        "TOP=1\n[db]\nhost = localhost\nport = 5432\n[cache]\nhost = 127.0.0.1\n  [ spaced ]  \nx = y\n");
+    check_str(&c, "TOP", "1", "ini: pre-section key bare");
+    check_str(&c, "db.host", "localhost", "ini: db.host");
+    check_str(&c, "db.port", "5432", "ini: db.port");
+    check_str(&c, "cache.host", "127.0.0.1", "ini: section switch");
+    check_str(&c, "spaced.x", "y", "ini: section name trimmed");
+    assert_false(cfg_has(&c, "host"), "ini: bare host not leaked");
+    cfg_free(&c);
+}
+
+fun test_duplicates_and_malformed() <noret> {
+    let c <Cfg> = cfg_new();
+    let n <int> = cfg_load_text(&c,
+        "K=first\nnot-a-pair\n=nokey\nK=second\n");
+    assert_eq_int(n, 2, "dup: 2 keys loaded");
+    assert_eq_int(c.skipped, 2, "dup: 2 malformed skipped");
+    check_str(&c, "K", "second", "dup: last wins");
+    // A later load overrides an earlier one, same rule.
+    cfg_load_text(&c, "K=third\n");
+    check_str(&c, "K", "third", "dup: later load wins");
+    cfg_free(&c);
+}
+
+fun test_override_clone_safety() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c, "MODE=file\n");
+    // Heap key/value freed right after cfg_set: the override must survive
+    // (cfg_set clones). This is the xtest ownership lesson, re-tested.
+    let hk <string> = substr("MODE", 0, 4);
+    let hv <string> = substr("override", 0, 8);
+    cfg_set(&c, hk, hv);
+    free_str(hk);
+    free_str(hv);
+    check_str(&c, "MODE", "override", "override: cloned, survives free");
+    assert_eq_string(cfg_get_file(&c, "MODE"), "file", "override: file layer intact");
+    cfg_set(&c, "MODE", "again");
+    check_str(&c, "MODE", "again", "override: re-set replaces");
+    cfg_free(&c);
+}
+
+fun test_env_precedence() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c, "app.host=filehost\napp.port=1111\n");
+    // Key app.host maps to env APP_HOST.
+    set_env("APP_HOST", "envhost");
+    check_str(&c, "app.host", "envhost", "env: beats file");
+    check_str(&c, "app.port", "1111", "env: untouched key stays file");
+    cfg_set(&c, "app.host", "overridehost");
+    check_str(&c, "app.host", "overridehost", "env: override beats env");
+    // Explicitly empty env is a value, not a miss (cli.fin convention).
+    set_env("APP_PORT", "");
+    assert_eq_string(cfg_get(&c, "app.port", "dflt"), "", "env: empty env answers empty");
+    unset_env("APP_HOST");
+    unset_env("APP_PORT");
+    check_str(&c, "app.host", "overridehost", "env: unset restores override");
+    cfg_free(&c);
+    // Fresh cfg: unset env falls back to the file value.
+    let c2 <Cfg> = cfg_new();
+    cfg_load_text(&c2, "app.host=filehost\n");
+    check_str(&c2, "app.host", "filehost", "env: unset falls back to file");
+    cfg_free(&c2);
+}
+
+fun test_typed_getters() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c,
+        "POS=42\nNEG=-17\nPLUS=+8\nZERO=0\nPADDED=007\nMAX=2147483647\nOVER=2147483648\nNEGMIN=-2147483648\nHUGE=99999999999\nNOTNUM=12x\nSIGNONLY=-\nT1=TRUE\nT2=Yes\nT3=on\nT4=1\nF1=false\nF2=NO\nF3=off\nF4=0\nMAYBE=perhaps\n");
+    assert_eq_int(cfg_get_int(&c, "POS", -1), 42, "int: positive");
+    assert_eq_int(cfg_get_int(&c, "NEG", -1), -17, "int: negative");
+    assert_eq_int(cfg_get_int(&c, "PLUS", -1), 8, "int: plus sign");
+    assert_eq_int(cfg_get_int(&c, "ZERO", -1), 0, "int: zero");
+    assert_eq_int(cfg_get_int(&c, "PADDED", -1), 7, "int: leading zeros");
+    assert_eq_int(cfg_get_int(&c, "MAX", -1), 2147483647, "int: int32 max ok");
+    assert_eq_int(cfg_get_int(&c, "OVER", -1), -1, "int: int32 max+1 defaults");
+    assert_eq_int(cfg_get_int(&c, "NEGMIN", -1), 0 - 2147483647 - 1, "int: int32 min ok");
+    assert_eq_int(cfg_get_int(&c, "HUGE", -1), -1, "int: huge defaults");
+    assert_eq_int(cfg_get_int(&c, "NOTNUM", -1), -1, "int: junk defaults");
+    assert_eq_int(cfg_get_int(&c, "SIGNONLY", -1), -1, "int: lone sign defaults");
+    assert_eq_int(cfg_get_int(&c, "MISSING", 99), 99, "int: missing defaults");
+    assert_true(cfg_get_bool(&c, "T1", false), "bool: TRUE");
+    assert_true(cfg_get_bool(&c, "T2", false), "bool: Yes");
+    assert_true(cfg_get_bool(&c, "T3", false), "bool: on");
+    assert_true(cfg_get_bool(&c, "T4", false), "bool: 1");
+    assert_false(cfg_get_bool(&c, "F1", true), "bool: false");
+    assert_false(cfg_get_bool(&c, "F2", true), "bool: NO");
+    assert_false(cfg_get_bool(&c, "F3", true), "bool: off");
+    assert_false(cfg_get_bool(&c, "F4", true), "bool: 0");
+    assert_true(cfg_get_bool(&c, "MAYBE", true), "bool: unknown answers default true");
+    assert_false(cfg_get_bool(&c, "MAYBE", false), "bool: unknown answers default false");
+    assert_true(cfg_get_bool(&c, "MISSING", true), "bool: missing answers default");
+    cfg_free(&c);
+}
+
+fun test_lists() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c, "HOSTS=a,b, c ,d\n");
+    let hosts <&Collection<string>> = cfg_get_list(&c, "HOSTS", ',');
+    assert_eq_int(hosts.len(), 4, "list: 4 parts");
+    assert_eq_string(hosts.get(0), "a", "list: first part");
+    assert_eq_string(hosts.get(2), " c ", "list: split is raw, no trimming");
+    assert_eq_string(hosts.get(3), "d", "list: last part");
+    for (let i <int> = 0; i < hosts.len(); i++) {
+        free_str(hosts.get(i));
+    }
+    delete hosts;
+    let empty <&Collection<string>> = cfg_get_list(&c, "MISSING", ',');
+    assert_eq_int(empty.len(), 0, "list: missing is empty");
+    delete empty;
+    cfg_free(&c);
+}
+
+fun test_expansion() <noret> {
+    let c <Cfg> = cfg_new();
+    cfg_load_text(&c, "ROOT=/srv/app\nHOME_DIR=${ROOT}/home\n");
+    let e1 <string> = cfg_expand(&c, "${ROOT}/bin");
+    assert_eq_string(e1, "/srv/app/bin", "expand: basic ref");
+    free_str(e1);
+    let e2 <string> = cfg_expand(&c, "cost $$5 and ${NOPE} here");
+    assert_eq_string(e2, "cost $5 and ${NOPE} here", "expand: escape + unknown literal");
+    free_str(e2);
+    let e3 <string> = cfg_expand(&c, "open ${ROOT");
+    assert_eq_string(e3, "open ${ROOT", "expand: unterminated literal");
+    free_str(e3);
+    // One pass: HOME_DIR's own ${ROOT} is NOT re-expanded.
+    let e4 <string> = cfg_expand(&c, "dir=${HOME_DIR}");
+    assert_eq_string(e4, "dir=${ROOT}/home", "expand: single pass, no recursion");
+    free_str(e4);
+    // cfg_get_expanded applies expansion to the stored value.
+    let e5 <string> = cfg_get_expanded(&c, "HOME_DIR", "");
+    assert_eq_string(e5, "/srv/app/home", "expand: get_expanded resolves");
+    free_str(e5);
+    cfg_free(&c);
+}
+
+fun test_file_loading() <noret> {
+    let c <Cfg> = cfg_new();
+    assert_eq_int(cfg_load_file(&c, "/tmp/finconfig-does-not-exist-xyz.env"), -1, "file: missing is -1");
+    write_string("/tmp/finconfig-test.env", "FROM_FILE=yes\n[svc]\nport=8080\n");
+    let n <int> = cfg_load_file(&c, "/tmp/finconfig-test.env");
+    assert_eq_int(n, 2, "file: 2 keys from file");
+    check_str(&c, "FROM_FILE", "yes", "file: top key");
+    check_str(&c, "svc.port", "8080", "file: section key");
+    cfg_free(&c);
+}
+
+fun main() <noret> {
+    test_dotenv_basics();
+    test_quoting();
+    test_ini_sections();
+    test_duplicates_and_malformed();
+    test_override_clone_safety();
+    test_env_precedence();
+    test_typed_getters();
+    test_lists();
+    test_expansion();
+    test_file_loading();
+    printf("ALL TESTS PASSED\n");
+}
